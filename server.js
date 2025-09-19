@@ -33,15 +33,18 @@ function verifyTwilio(req) {
   return sig === expected;
 }
 
+/** Voice webhook → return TwiML that opens a Media Stream */
 app.post('/twilio/voice', (req, res) => {
   if (!verifyTwilio(req)) return res.status(403).send('Bad signature');
-  const streamUrl = `${PUBLIC_BASE_URL.replace(/\/$/,'')}/stream`;
+
+  // IMPORTANT: use WSS for the media stream (Twilio requires wss://)
+  const streamUrl = `${PUBLIC_BASE_URL.replace(/^http/, 'ws').replace(/\/$/, '')}/stream`;
+
   const xmlObj = {
     Response: {
       Connect: {
         Stream: {
           '@_url': streamUrl,
-          '@_bidirectional': 'true',
           Parameter: [{ '@_name': 'caller', '@_value': req.body.From || '' }]
         }
       }
