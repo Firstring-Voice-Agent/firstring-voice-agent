@@ -36,7 +36,8 @@ function verifyTwilio(req) {
   if (!TWILIO_AUTH_TOKEN) return true;
   const url = `${PUBLIC_BASE_URL}/twilio/voice`;
   const params = Object.keys(req.body).sort().map(k => k + req.body[k]).join('');
-  const expected = crypto.createHmac('sha1', TWILIO_AUTH_TOKEN).update(url + params, 'utf8').digest('base64');
+  const expected = crypto.createHmac('sha1', TWILIO_AUTH_TOKEN)
+    .update(url + params, 'utf8').digest('base64');
   const sig = req.headers['x-twilio-signature'];
   return sig === expected;
 }
@@ -58,9 +59,8 @@ app.post('/twilio/voice', (req, res) => {
     }
   };
   const builder = new XMLBuilder({ ignoreAttributes: false });
-  const xml = builder.build(xmlObj);
   res.set('Cache-Control', 'no-cache');
-  res.type('text/xml').send(xml);
+  res.type('text/xml').send(builder.build(xmlObj));
 });
 
 /* ========= TTS ========= */
@@ -133,9 +133,8 @@ async function wsSendMedia(ws, mulawBytes, streamSid) {
     const chunk = mulawBytes.slice(i, i + chunkSize);
     const msg = {
       event: 'media',
-      streamSid,                   // REQUIRED
+      streamSid,                   // REQUIRED by Twilio for bidirectional media
       media: { payload: Buffer.from(chunk).toString('base64') }
-      // track not required for outbound; Twilio infers from streamSid
     };
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
     await sleep(20);
@@ -191,7 +190,12 @@ async function llmExtract(text) {
 }
 
 /* ========= WS BRIDGE (Twilio <-> Deepgram) ========= */
-const wss = new WebSocketServer({ noServer: true });
+// IMPORTANT: echo Twilio sub-protocol 'audio-stream'
+const wss = new WebSocketServer({
+  noServer: true,
+  handleProtocols: (protocols /*, request */) =>
+    protocols.includes('audio-stream') ? 'audio-stream' : false
+});
 
 wss.on('connection', async (ws, req) => {
   console.log('WS_CONNECTED', req.url);
@@ -200,7 +204,8 @@ wss.on('connection', async (ws, req) => {
   let mediaCount = 0;
 
   // Deepgram
-  const dgUrl = 'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&punctuate=true&model=enhanced';
+  const dgUrl =
+    'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&punctuate=true&model=enhanced';
   const dg = new WebSocket(dgUrl, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }});
 
   dg.on('open', () => console.log('DG_OPEN'));
@@ -213,7 +218,9 @@ wss.on('connection', async (ws, req) => {
       const transcript = alt.transcript || '';
       if (msg.is_final && transcript) {
         state.fullTranscript.push(transcript);
-        const reply = await llmReply(`Caller said: "${transcript}". Reply in one sentence as a helpful trades receptionist. Confirm details when you have enough info.`);
+        const reply = await llmReply(
+          `Caller said: "${transcript}". Reply in one sentence as a helpful trades receptionist. Confirm details when you have enough info.`
+        );
         const bytes = await ttsSynthesize(reply);
         console.log('TTS_REPLY_LEN', bytes.length);
         await wsSendMedia(ws, bytes, state.streamSid);
