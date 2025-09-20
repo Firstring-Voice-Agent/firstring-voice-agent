@@ -25,7 +25,7 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// noisy health endpoints
+// simple health + root
 app.get('/', (_, res) => { console.log('HTTP_GET /'); res.send('ok'); });
 app.get('/healthz', (_, res) => { console.log('HTTP_GET /healthz'); res.send('ok'); });
 
@@ -62,7 +62,7 @@ app.post('/twilio/voice', (req, res) => {
   res.type('text/xml').send(builder.build(xmlObj));
 });
 
-// ======= audio helpers
+// ---------- audio helpers ----------
 function encodeLinearToMuLaw(sample) {
   const sign = sample < 0 ? 0x80 : 0;
   if (sample < 0) sample = -sample;
@@ -75,18 +75,17 @@ function encodeLinearToMuLaw(sample) {
 async function ttsOpenAI(text) {
   if (!OPENAI_API_KEY) return new Uint8Array(0);
   try {
-    console.log('TTS_OPENAI start, len=', text?.length);
+    console.log('TTS_OPENAI start len=', text?.length);
     const r = await axios.post('https://api.openai.com/v1/audio/speech', {
       model: 'gpt-4o-mini-tts',
       voice: 'alloy',
       input: text
     }, { responseType: 'arraybuffer', headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }});
     const pcm16 = new Int16Array(new Uint8Array(r.data).buffer);
-    const step = 3;
+    const step = 3; // naive ~24k -> 8k downsample
     const out = new Uint8Array(Math.floor(pcm16.length / step));
     for (let i = 0, j = 0; i < pcm16.length; i += step, j++) {
-      const s = Math.max(-32768, Math.min(32767, pcm16[i]));
-      out[j] = encodeLinearToMuLaw(s);
+      out[j] = encodeLinearToMuLaw(Math.max(-32768, Math.min(32767, pcm16[i])));
     }
     console.log('TTS_OPENAI ok bytes=', out.length);
     return out;
@@ -103,7 +102,7 @@ async function ttsSynthesize(text) {
   }
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=4&output_format=ulaw_8000`;
   try {
-    console.log('TTS_11LABS start, len=', text?.length);
+    console.log('TTS_11LABS start len=', text?.length);
     const r = await axios.post(
       url,
       {
@@ -132,7 +131,7 @@ async function ttsSynthesize(text) {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function wsSendMedia(ws, mulawBytes, streamSid) {
   if (!streamSid) { console.error('TWILIO_NO_STREAMSID'); return; }
-  const chunkSize = 160; // 20ms @8k
+  const chunkSize = 160; // 20ms @ 8kHz
   for (let i = 0; i < mulawBytes.length; i += chunkSize) {
     const chunk = mulawBytes.slice(i, i + chunkSize);
     const msg = { event: 'media', streamSid, media: { payload: Buffer.from(chunk).toString('base64') } };
@@ -143,15 +142,12 @@ async function wsSendMedia(ws, mulawBytes, streamSid) {
 
 async function llmReply(prompt, system = 'Stay concise. Ask only what you need to book a job.') {
   try {
-    console.log('LLM_REPLY send');
     const r = await axios.post('https://api.openai.com/v1/chat/completions', {
       model: 'gpt-4o-mini',
       temperature: 0.3,
       messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }]
     }, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }});
-    const out = r.data.choices?.[0]?.message?.content?.trim() || 'Got it.';
-    console.log('LLM_REPLY ok');
-    return out;
+    return r.data.choices?.[0]?.message?.content?.trim() || 'Got it.';
   } catch (e) {
     console.error('LLM_REPLY_ERR', e?.response?.status, e?.response?.data || e.message);
     return 'Okay.';
@@ -164,47 +160,26 @@ function parseJsonLoose(text) {
   if (s === -1 || e === -1 || e < s) return null;
   try { return JSON.parse(text.slice(s, e + 1)); } catch { return null; }
 }
-
 async function llmExtract(text) {
   const prompt = `Extract strict JSON with fields:
   caller_name, suburb, job_type, urgency(one of: now,today,this_week,no_rush), preferred_time, call_summary.
   Only return JSON. Message:\n${text}`;
   try {
-    console.log('LLM_EXTRACT send');
     const r = await axios.post('https://api.openai.com/v1/chat/completions', {
       model: 'gpt-4o-mini',
       temperature: 0,
       messages: [{ role: 'system', content: 'You output only strict JSON.' }, { role: 'user', content: prompt }]
     }, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }});
-    const raw = r.data.choices?.[0]?.message?.content?.trim() || '{}';
-    const parsed = parseJsonLoose(raw);
-    console.log('LLM_EXTRACT ok');
-    return parsed || { caller_name: '', suburb: '', job_type: '', urgency: 'this_week', preferred_time: '', call_summary: text.slice(0,800) };
+    return parseJsonLoose(r.data.choices?.[0]?.message?.content?.trim() || '{}')
+      || { caller_name: '', suburb: '', job_type: '', urgency: 'this_week', preferred_time: '', call_summary: text.slice(0,800) };
   } catch (e) {
     console.error('LLM_EXTRACT_ERR', e?.response?.status, e?.response?.data || e.message);
     return { caller_name: '', suburb: '', job_type: '', urgency: 'this_week', preferred_time: '', call_summary: text.slice(0,800) };
   }
 }
 
-// ---------- WebSocket server (robust subprotocol handling)
-const wss = new WebSocketServer({
-  noServer: true,
-  handleProtocols: (protocols) => {
-    // protocols can be a Set (ws), Array, or String; normalize to array of names
-    let offered = [];
-    if (protocols && typeof protocols[Symbol.iterator] === 'function' && !(protocols instanceof String)) {
-      try { offered = [...protocols].map(String); } catch { offered = []; }
-    } else if (Array.isArray(protocols)) {
-      offered = protocols.map(String);
-    } else if (typeof protocols === 'string') {
-      offered = protocols.split(',').map(s => s.trim());
-    }
-    const wanted = ['audio', 'audio-stream'];
-    const match = offered.find(p => wanted.includes(p));
-    console.log('WS_HANDLE_PROTOCOLS got=', offered, '->', match || 'none');
-    return match || false; // require a valid subprotocol
-  }
-});
+// -------- WebSocket server (no protocol gate) --------
+const wss = new WebSocketServer({ noServer: true });
 
 wss.on('connection', async (ws, req) => {
   console.log('WS_CONNECTED', req.url);
@@ -212,6 +187,7 @@ wss.on('connection', async (ws, req) => {
   const state = { id: sessionId, caller: '', streamSid: '', fullTranscript: [] };
   let mediaCount = 0;
 
+  // Deepgram streaming ASR
   const dgUrl = 'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&punctuate=true&model=enhanced';
   console.log('DG_CONNECT', dgUrl);
   const dg = new WebSocket(dgUrl, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }});
@@ -226,7 +202,7 @@ wss.on('connection', async (ws, req) => {
       const transcript = alt.transcript || '';
       if (msg.is_final && transcript) {
         state.fullTranscript.push(transcript);
-        const reply = await llmReply(`Caller said: "${transcript}". Reply in one sentence as a helpful trades receptionist. Confirm details when you have enough info.`);
+        const reply = await llmReply(`Caller said: "${transcript}". Reply in one sentence as a helpful trades receptionist. Confirm details when ready to book.`);
         const bytes = await ttsSynthesize(reply);
         console.log('TTS_REPLY_LEN', bytes.length);
         await wsSendMedia(ws, bytes, state.streamSid);
@@ -266,11 +242,16 @@ wss.on('connection', async (ws, req) => {
   ws.on('error', (e) => console.error('WS_ERR', e.message));
 });
 
+// HTTP upgrade handler
 const server = http.createServer(app);
 server.on('upgrade', (req, socket, head) => {
-  console.log('WS_UPGRADE', req.url, 'headers.protocol=', req.headers['sec-websocket-protocol']);
+  const protoHeader = req.headers['sec-websocket-protocol'] || '';
+  console.log('WS_UPGRADE', req.url, 'protoHeader=', protoHeader);
   if (req.url === '/stream') {
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    // accept regardless of subprotocol to avoid compatibility issues
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+    });
   } else {
     socket.destroy();
   }
@@ -279,10 +260,7 @@ server.on('upgrade', (req, socket, head) => {
 server.listen(PORT, () => {
   console.log('FirstRing (Deepgram+11Labs/OpenAI fallback) on', PORT);
   console.log('ENV_CHECK', {
-    PUBLIC_BASE_URL,
-    HAVE_DG: !!DEEPGRAM_API_KEY,
-    HAVE_OAI: !!OPENAI_API_KEY,
-    HAVE_XI: !!ELEVENLABS_API_KEY,
-    VOICE: ELEVENLABS_VOICE_ID
+    PUBLIC_BASE_URL, HAVE_DG: !!DEEPGRAM_API_KEY, HAVE_OAI: !!OPENAI_API_KEY,
+    HAVE_XI: !!ELEVENLABS_API_KEY, VOICE: ELEVENLABS_VOICE_ID
   });
 });
