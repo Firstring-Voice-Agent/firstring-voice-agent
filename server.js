@@ -83,7 +83,7 @@ async function ttsOpenAI(text) {
       input: text
     }, { responseType: 'arraybuffer', headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }});
     const pcm16 = new Int16Array(new Uint8Array(r.data).buffer);
-    const step = 3;
+    const step = 3; // crude ~24k -> 8k downsample; good enough for fallback
     const out = new Uint8Array(Math.floor(pcm16.length / step));
     for (let i = 0, j = 0; i < pcm16.length; i += step, j++) {
       const s = Math.max(-32768, Math.min(32767, pcm16[i]));
@@ -98,6 +98,7 @@ async function ttsOpenAI(text) {
 }
 
 async function ttsSynthesize(text) {
+  // Primary = ElevenLabs (μ-law 8k stream), fallback to OpenAI
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
     console.warn('TTS_11LABS missing key/voice, using OpenAI fallback');
     return await ttsOpenAI(text);
@@ -117,8 +118,7 @@ async function ttsSynthesize(text) {
     const ct = (r.headers?.['content-type'] || '').toLowerCase();
     if (ct.includes('application/json')) {
       console.error('TTS_11LABS_JSON', Buffer.from(r.data).toString('utf8'));
-      const fb = await ttsOpenAI(text);
-      return fb;
+      return await ttsOpenAI(text);
     }
     const out = new Uint8Array(r.data);
     console.log('TTS_11LABS ok bytes=', out.length);
@@ -127,15 +127,14 @@ async function ttsSynthesize(text) {
     let body = '';
     try { body = Buffer.from(e?.response?.data || []).toString('utf8'); } catch {}
     console.error('TTS_11LABS_ERR', e?.response?.status, body || e.message);
-    const fb = await ttsOpenAI(text);
-    return fb;
+    return await ttsOpenAI(text);
   }
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function wsSendMedia(ws, mulawBytes, streamSid) {
   if (!streamSid) { console.error('TWILIO_NO_STREAMSID'); return; }
-  const chunkSize = 160;
+  const chunkSize = 160; // 20ms @ 8kHz μ-law
   for (let i = 0; i < mulawBytes.length; i += chunkSize) {
     const chunk = mulawBytes.slice(i, i + chunkSize);
     const msg = { event: 'media', streamSid, media: { payload: Buffer.from(chunk).toString('base64') } };
@@ -160,12 +159,14 @@ async function llmReply(prompt, system = 'Stay concise. Ask only what you need t
     return 'Okay.';
   }
 }
+
 function parseJsonLoose(text) {
   if (!text) return null;
   const s = text.indexOf('{'), e = text.lastIndexOf('}');
   if (s === -1 || e === -1 || e < s) return null;
   try { return JSON.parse(text.slice(s, e + 1)); } catch { return null; }
 }
+
 async function llmExtract(text) {
   const prompt = `Extract strict JSON with fields:
   caller_name, suburb, job_type, urgency(one of: now,today,this_week,no_rush), preferred_time, call_summary.
@@ -187,12 +188,28 @@ async function llmExtract(text) {
   }
 }
 
-// WebSocket with explicit protocol negotiation
+/* =========================
+   WebSocket server (Twilio Media Streams)
+   ========================= */
 const wss = new WebSocketServer({
   noServer: true,
   handleProtocols: (protocols) => {
-    console.log('WS_HANDLE_PROTOCOLS got=', protocols);
-    return protocols.includes('audio-stream') ? 'audio-stream' : false;
+    // protocols can be a Set (ws v8), an Array (older ws), or a comma string
+    let hasAudioStream = false;
+
+    if (protocols && typeof protocols.has === 'function') {
+      // Set
+      hasAudioStream = protocols.has('audio-stream');
+    } else if (Array.isArray(protocols)) {
+      // Array
+      hasAudioStream = protocols.includes('audio-stream');
+    } else if (typeof protocols === 'string') {
+      // Comma-separated header value
+      hasAudioStream = protocols.split(',').map(s => s.trim()).includes('audio-stream');
+    }
+
+    console.log('WS_HANDLE_PROTOCOLS got=', protocols, '->', hasAudioStream ? 'audio-stream' : 'rejected');
+    return hasAudioStream ? 'audio-stream' : false;
   }
 });
 
@@ -202,6 +219,7 @@ wss.on('connection', async (ws, req) => {
   const state = { id: sessionId, caller: '', streamSid: '', fullTranscript: [] };
   let mediaCount = 0;
 
+  // Deepgram streaming ASR
   const dgUrl = 'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&punctuate=true&model=enhanced';
   console.log('DG_CONNECT', dgUrl);
   const dg = new WebSocket(dgUrl, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }});
@@ -246,6 +264,25 @@ wss.on('connection', async (ws, req) => {
         const text = state.fullTranscript.join(' ');
         const fields = await llmExtract(text || 'Caller hung up quickly.');
         console.log('POST_LEAD', fields);
+        // (Optional) post to n8n here if N8N_BASE is set
+        if (N8N_BASE) {
+          try {
+            await axios.post(`${N8N_BASE.replace(/\/$/,'')}/webhook/receptionist/lead_finalized`, {
+              ...fields,
+              caller_number: state.caller,
+              channel: 'voice',
+              business_id: BUSINESS_ID,
+              business_name: BUSINESS_NAME,
+              calendar_summary_prefix: CAL_SUMMARY_PREFIX,
+              transcript_url: '',
+              booking_link: '',
+              agent_session_id: sessionId
+            }, { timeout: 8000 });
+            console.log('N8N_POST_OK');
+          } catch (e) {
+            console.error('N8N_POST_ERR', e?.response?.status, e?.response?.data || e.message);
+          }
+        }
       }
     } catch (e) {
       console.error('WS_MSG_ERR', e.message);
@@ -268,5 +305,11 @@ server.on('upgrade', (req, socket, head) => {
 
 server.listen(PORT, () => {
   console.log('FirstRing (Deepgram+11Labs/OpenAI fallback) on', PORT);
-  console.log('ENV_CHECK', { PUBLIC_BASE_URL, HAVE_DG: !!DEEPGRAM_API_KEY, HAVE_OAI: !!OPENAI_API_KEY, HAVE_XI: !!ELEVENLABS_API_KEY, VOICE: ELEVENLABS_VOICE_ID });
+  console.log('ENV_CHECK', {
+    PUBLIC_BASE_URL,
+    HAVE_DG: !!DEEPGRAM_API_KEY,
+    HAVE_OAI: !!OPENAI_API_KEY,
+    HAVE_XI: !!ELEVENLABS_API_KEY,
+    VOICE: ELEVENLABS_VOICE_ID
+  });
 });
