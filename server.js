@@ -25,35 +25,25 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Noisy health endpoints
+// noisy health endpoints
 app.get('/', (_, res) => { console.log('HTTP_GET /'); res.send('ok'); });
 app.get('/healthz', (_, res) => { console.log('HTTP_GET /healthz'); res.send('ok'); });
 
-// ---- Twilio signature verification (POST only)
 function verifyTwilio(req) {
   if (!TWILIO_AUTH_TOKEN) return true;
-  try {
-    const url = `${PUBLIC_BASE_URL}/twilio/voice`;
-    const paramsConcat = Object.keys(req.body)
-      .sort()
-      .map(k => k + (req.body[k] ?? ''))
-      .join('');
-    const expected = crypto
-      .createHmac('sha1', TWILIO_AUTH_TOKEN)
-      .update(url + paramsConcat, 'utf8')
-      .digest('base64');
-    const sig = req.headers['x-twilio-signature'];
-    const ok = sig === expected;
-    if (!ok) console.error('TWILIO_SIGNATURE_FAIL', { sig, expected });
-    return ok;
-  } catch (e) {
-    console.error('TWILIO_SIGNATURE_ERR', e.message);
-    return false;
-  }
+  const url = `${PUBLIC_BASE_URL}/twilio/voice`;
+  const params = Object.keys(req.body).sort().map(k => k + req.body[k]).join('');
+  const expected = crypto.createHmac('sha1', TWILIO_AUTH_TOKEN).update(url + params, 'utf8').digest('base64');
+  const sig = req.headers['x-twilio-signature'];
+  const ok = sig === expected;
+  if (!ok) console.error('TWILIO_SIGNATURE_FAIL');
+  return ok;
 }
 
-// Helper to build the Stream TwiML
-function buildStreamTwiml(fromNumber = '') {
+app.post('/twilio/voice', (req, res) => {
+  console.log('HTTP_POST /twilio/voice: received, From=', req.body?.From, 'PUBLIC_BASE_URL=', PUBLIC_BASE_URL);
+  if (!verifyTwilio(req)) return res.status(403).send('Bad signature');
+
   const streamUrl = `${PUBLIC_BASE_URL.replace(/^http/, 'ws').replace(/\/$/, '')}/stream`;
   console.log('Responding with <Stream> url=', streamUrl);
 
@@ -63,31 +53,16 @@ function buildStreamTwiml(fromNumber = '') {
         Stream: {
           '@_url': streamUrl,
           '@_bidirectional': 'true',
-          Parameter: [{ '@_name': 'caller', '@_value': fromNumber || '' }]
+          Parameter: [{ '@_name': 'caller', '@_value': req.body.From || '' }]
         }
       }
     }
   };
   const builder = new XMLBuilder({ ignoreAttributes: false });
-  return builder.build(xmlObj);
-}
-
-// === NEW: GET handler so you (and Twilio, temporarily) can hit it via GET
-app.get('/twilio/voice', (req, res) => {
-  console.log('HTTP_GET /twilio/voice: received, From=', req.query?.From, 'PUBLIC_BASE_URL=', PUBLIC_BASE_URL);
-  const xml = buildStreamTwiml(req.query?.From || '');
-  res.type('text/xml').send(xml);
+  res.type('text/xml').send(builder.build(xmlObj));
 });
 
-// POST handler (normal Twilio flow)
-app.post('/twilio/voice', (req, res) => {
-  console.log('HTTP_POST /twilio/voice: received, From=', req.body?.From, 'PUBLIC_BASE_URL=', PUBLIC_BASE_URL);
-  if (!verifyTwilio(req)) return res.status(403).send('Bad signature');
-  const xml = buildStreamTwiml(req.body?.From || '');
-  res.type('text/xml').send(xml);
-});
-
-// ======= audio + TTS helpers (unchanged)
+// ======= audio helpers
 function encodeLinearToMuLaw(sample) {
   const sign = sample < 0 ? 0x80 : 0;
   if (sample < 0) sample = -sample;
@@ -107,7 +82,7 @@ async function ttsOpenAI(text) {
       input: text
     }, { responseType: 'arraybuffer', headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }});
     const pcm16 = new Int16Array(new Uint8Array(r.data).buffer);
-    const step = 3; // crude downsample
+    const step = 3;
     const out = new Uint8Array(Math.floor(pcm16.length / step));
     for (let i = 0, j = 0; i < pcm16.length; i += step, j++) {
       const s = Math.max(-32768, Math.min(32767, pcm16[i]));
@@ -157,7 +132,7 @@ async function ttsSynthesize(text) {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function wsSendMedia(ws, mulawBytes, streamSid) {
   if (!streamSid) { console.error('TWILIO_NO_STREAMSID'); return; }
-  const chunkSize = 160; // 20ms @ 8kHz μ-law
+  const chunkSize = 160; // 20ms @8k
   for (let i = 0; i < mulawBytes.length; i += chunkSize) {
     const chunk = mulawBytes.slice(i, i + chunkSize);
     const msg = { event: 'media', streamSid, media: { payload: Buffer.from(chunk).toString('base64') } };
@@ -211,23 +186,23 @@ async function llmExtract(text) {
   }
 }
 
-/* =========================
-   WebSocket server (Twilio Media Streams)
-   ========================= */
+// ---------- WebSocket server (robust subprotocol handling)
 const wss = new WebSocketServer({
   noServer: true,
   handleProtocols: (protocols) => {
-    // protocols may be Set, Array, or comma string depending on ws version
-    let hasAudioStream = false;
-    if (protocols && typeof protocols.has === 'function') {
-      hasAudioStream = protocols.has('audio-stream');        // Set
+    // protocols can be a Set (ws), Array, or String; normalize to array of names
+    let offered = [];
+    if (protocols && typeof protocols[Symbol.iterator] === 'function' && !(protocols instanceof String)) {
+      try { offered = [...protocols].map(String); } catch { offered = []; }
     } else if (Array.isArray(protocols)) {
-      hasAudioStream = protocols.includes('audio-stream');   // Array
+      offered = protocols.map(String);
     } else if (typeof protocols === 'string') {
-      hasAudioStream = protocols.split(',').map(s => s.trim()).includes('audio-stream'); // string
+      offered = protocols.split(',').map(s => s.trim());
     }
-    console.log('WS_HANDLE_PROTOCOLS got=', protocols, '->', hasAudioStream ? 'audio-stream' : 'rejected');
-    return hasAudioStream ? 'audio-stream' : false;
+    const wanted = ['audio', 'audio-stream'];
+    const match = offered.find(p => wanted.includes(p));
+    console.log('WS_HANDLE_PROTOCOLS got=', offered, '->', match || 'none');
+    return match || false; // require a valid subprotocol
   }
 });
 
@@ -281,24 +256,6 @@ wss.on('connection', async (ws, req) => {
         const text = state.fullTranscript.join(' ');
         const fields = await llmExtract(text || 'Caller hung up quickly.');
         console.log('POST_LEAD', fields);
-        if (N8N_BASE) {
-          try {
-            await axios.post(`${N8N_BASE.replace(/\/$/,'')}/webhook/receptionist/lead_finalized`, {
-              ...fields,
-              caller_number: state.caller,
-              channel: 'voice',
-              business_id: BUSINESS_ID,
-              business_name: BUSINESS_NAME,
-              calendar_summary_prefix: CAL_SUMMARY_PREFIX,
-              transcript_url: '',
-              booking_link: '',
-              agent_session_id: sessionId
-            }, { timeout: 8000 });
-            console.log('N8N_POST_OK');
-          } catch (e) {
-            console.error('N8N_POST_ERR', e?.response?.status, e?.response?.data || e.message);
-          }
-        }
       }
     } catch (e) {
       console.error('WS_MSG_ERR', e.message);
