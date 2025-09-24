@@ -7,12 +7,8 @@ import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 
 const parsePathname = (req) => {
-  try {
-    const u = new URL(req.url, 'https://placeholder.local');
-    return u.pathname;
-  } catch {
-    return '/';
-  }
+  try { return new URL(req.url, 'https://placeholder.local').pathname; }
+  catch { return '/'; }
 };
 
 const {
@@ -46,22 +42,19 @@ app.get('/healthz', (_, res) => res.status(200).send('ok'));
 // Twilio Voice Webhook -> returns TwiML with <Connect><Stream>
 app.post('/twilio/voice', (req, res) => {
   log('info', 'HTTP_POST /twilio/voice', { from: req.body?.From, to: req.body?.To });
+  if (!PUBLIC_BASE_URL) return res.status(500).send('Server config error');
 
-  if (!PUBLIC_BASE_URL) {
-    log('error', 'PUBLIC_BASE_URL missing');
-    return res.status(500).send('Server config error');
-  }
-
-  const root = PUBLIC_BASE_URL.replace(/\/+$/, '');
+  const root = PUBLIC_BASE_URL.replace(/\/+$/,'');
   const wssRoot = root.replace(/^http/i, 'ws');
   const streamUrl = `${wssRoot}/stream`;
 
+  // Valid for <Connect><Stream>: inbound_track (default)
   const twimlObj = {
     Response: {
       Connect: {
         Stream: {
           '@_url': streamUrl,
-          '@_track': 'both_tracks' // <-- allow inbound to us AND outbound back to caller
+          '@_track': 'inbound_track'
         }
       }
     }
@@ -77,81 +70,52 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
-  const pathname = parsePathname(request);
-  if (pathname === '/stream') {
+  if (parsePathname(request) === '/stream') {
     log('info', 'WS_UPGRADE /stream');
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit('connection', ws, request);
-    });
+    wss.handleUpgrade(request, socket, head, (ws) => wss.emit('connection', ws, request));
   } else {
     socket.destroy();
   }
 });
 
-// --- Outbound audio framing helpers ---
-const ULawSilence = 0xFF;
-const FRAME_BYTES = 160;   // 20ms @ 8kHz u-law mono
+// --- Outbound audio helpers ---
+const ULawSilence = 0xFF;     // μ-law silence
+const FRAME_BYTES = 160;       // 20ms @ 8kHz μ-law mono
 
 const padToFrame = (buf) => {
   const rem = buf.length % FRAME_BYTES;
-  if (rem === 0) return buf;
-  const pad = Buffer.alloc(FRAME_BYTES - rem, ULawSilence);
-  return Buffer.concat([buf, pad]);
+  return rem === 0 ? buf : Buffer.concat([buf, Buffer.alloc(FRAME_BYTES - rem, ULawSilence)]);
 };
-
 const buildSilence = (frames = 3) => Buffer.alloc(FRAME_BYTES * frames, ULawSilence);
 
-// --- Audio sender to Twilio ---
+// Outbound sender: ONLY {event:'media', streamSid, media:{payload}}
 const startAudioSender = (ws, streamSid) => {
-  let queue = [];
-  let sending = false;
+  let q = []; let sending = false; let primed = false;
 
-  const chunkToFrames = (buf) => {
-    const frames = [];
-    const padded = padToFrame(buf);
-    for (let i = 0; i < padded.length; i += FRAME_BYTES) {
-      frames.push(padded.subarray(i, i + FRAME_BYTES));
-    }
-    return frames;
+  const toFrames = (buf) => {
+    const p = padToFrame(buf);
+    const out = [];
+    for (let i = 0; i < p.length; i += FRAME_BYTES) out.push(p.subarray(i, i + FRAME_BYTES));
+    return out;
   };
 
-  const primeIfNeeded = () => {
-    if (queue._primed) return;
-    queue.unshift(...chunkToFrames(buildSilence(3)));
-    queue._primed = true;
+  const ensurePrime = () => {
+    if (primed) return;
+    q.unshift(...toFrames(buildSilence(3)));
+    primed = true;
   };
 
-  const sendChunk = () => {
-    if (!queue.length || ws.readyState !== WebSocket.OPEN) {
-      sending = false;
-      return;
-    }
-    const frame = queue.shift();
-    const payload = frame.toString('base64');
-
-    const msg = {
-      event: 'media',
-      streamSid,
-      track: 'outbound', // tell Twilio this is for the caller path
-      media: {
-        // leaving contentType helps some regions; harmless otherwise
-        contentType: 'audio/x-mulaw;rate=8000',
-        payload
-      }
-    };
-
+  const tick = () => {
+    if (!q.length || ws.readyState !== WebSocket.OPEN) { sending = false; return; }
+    const frame = q.shift();
+    const msg = { event: 'media', streamSid, media: { payload: frame.toString('base64') } };
     ws.send(JSON.stringify(msg));
-    setTimeout(sendChunk, 20);
+    setTimeout(tick, 20);
   };
 
   return {
-    enqueue: (buf) => {
-      primeIfNeeded();
-      const frames = chunkToFrames(buf);
-      queue.push(...frames);
-      if (!sending) { sending = true; sendChunk(); }
-    },
-    clear: () => { queue = []; queue._primed = false; }
+    enqueue: (buf) => { ensurePrime(); q.push(...toFrames(buf)); if (!sending) { sending = true; tick(); } },
+    clear: () => { q = []; primed = false; }
   };
 };
 
@@ -176,13 +140,12 @@ const generateReply = async (userText) => {
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
     });
     return resp.data?.choices?.[0]?.message?.content?.trim() || "Okay. How can I help?";
-  } catch (err) {
-    log('warn', 'LLM_FALLBACK', { err: err?.response?.data || err?.message });
+  } catch {
     return "Okay. How can I help?";
   }
 };
 
-// --- TTS (ElevenLabs ulaw_8000, fallback to OpenAI -> μ-law) ---
+// --- TTS (ElevenLabs μ-law 8k; fallback OpenAI->μ-law) ---
 const synthesizeUlaw8000 = async (text) => {
   if (ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID) {
     try {
@@ -192,9 +155,7 @@ const synthesizeUlaw8000 = async (text) => {
         { headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' }, responseType: 'arraybuffer', timeout: 20000 }
       );
       if (el.status === 200 && el.data?.byteLength) return Buffer.from(el.data);
-    } catch (err) {
-      log('warn', 'ELEVENLABS_TTS_FAIL', { err: err?.response?.data || err?.message });
-    }
+    } catch {}
   }
   try {
     if (!OPENAI_API_KEY) throw new Error('No OPENAI_API_KEY');
@@ -203,11 +164,10 @@ const synthesizeUlaw8000 = async (text) => {
       { model: 'gpt-4o-mini-tts', voice: 'alloy', input: text, format: 'pcm' },
       { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, responseType: 'arraybuffer', timeout: 25000 }
     );
-    const pcm = Buffer.from(tts.data); // 24k PCM16LE
+    const pcm = Buffer.from(tts.data);              // 24k PCM16LE
     const down = downsamplePCM16LE(pcm, 24000, 8000);
     return pcm16ToUlaw(down);
-  } catch (err) {
-    log('error', 'OPENAI_TTS_FAIL', { err: err?.response?.data || err?.message });
+  } catch {
     return Buffer.alloc(0);
   }
 };
