@@ -6,23 +6,17 @@ import { WebSocketServer, WebSocket, WebSocket as WSClient } from 'ws';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 
-// Safe URL pathname helper (WHATWG)
-const pathOf = (req) => {
-  try { return new URL(req.url, 'https://placeholder.local').pathname; }
-  catch { return '/'; }
-};
-
 const {
   PORT = 10000,
   PUBLIC_BASE_URL,
   OPENAI_API_KEY,
   DEEPGRAM_API_KEY,
-  ELEVENLABS_API_KEY,      // not used while FORCE_TTS_OPENAI=1
-  ELEVENLABS_VOICE_ID,     // not used while FORCE_TTS_OPENAI=1
+  ELEVENLABS_API_KEY,
+  ELEVENLABS_VOICE_ID,
   BUSINESS_NAME = 'Your Business',
   LOG_LEVEL = 'debug',
-  // Keep OpenAI-only TTS while we verify audio path
-  FORCE_TTS_OPENAI = '1'
+  FORCE_TTS_OPENAI = '1',
+  PLAY_TONE_FIRST = '1'   // <-- set to "1" to inject a 1s 440Hz μ-law test tone on each call
 } = process.env;
 
 const app = express();
@@ -39,10 +33,10 @@ const log = (level, msg, extra = {}) => {
 
 const xml = (obj) => new XMLBuilder({ ignoreAttributes: false }).build(obj);
 
-// ---------------- Health
+// -------- Health
 app.get('/healthz', (_, res) => res.status(200).send('ok'));
 
-// ---------------- Twilio Voice webhook → <Connect><Stream>
+// -------- Twilio webhook -> TwiML <Connect><Stream>
 app.post('/twilio/voice', (req, res) => {
   log('info', 'HTTP_POST /twilio/voice', { from: req.body?.From, to: req.body?.To });
   if (!PUBLIC_BASE_URL) return res.status(500).send('Missing PUBLIC_BASE_URL');
@@ -51,23 +45,22 @@ app.post('/twilio/voice', (req, res) => {
   const wssRoot = root.replace(/^http/i, 'ws');
   const streamUrl = `${wssRoot}/stream`;
 
-  // Valid per Twilio for <Connect><Stream>
-  const twimlObj = {
-    Response: {
-      Connect: {
-        Stream: { '@_url': streamUrl, '@_track': 'inbound_track' }
-      }
-    }
-  };
+  const twiml = xml({
+    Response: { Connect: { Stream: { '@_url': streamUrl, '@_track': 'inbound_track' } } }
+  });
 
-  const twiml = xml(twimlObj);
   log('info', 'Responding with <Stream>', { url: streamUrl });
   res.type('application/xml').status(200).send(twiml);
 });
 
-// ---------------- HTTP + single WS server
+// -------- HTTP + WS
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
+
+const pathOf = (req) => {
+  try { return new URL(req.url, 'https://placeholder.local').pathname; }
+  catch { return '/'; }
+};
 
 server.on('upgrade', (request, socket, head) => {
   if (pathOf(request) === '/stream') {
@@ -78,11 +71,9 @@ server.on('upgrade', (request, socket, head) => {
   }
 });
 
-// ---------------- μ-law helpers
-const ULawSilence = 0xFF;          // μ-law silence byte
-const FRAME_BYTES = 160;            // 20ms @ 8000 Hz μ-law mono
-
-const buildSilence = (frames = 3) => Buffer.alloc(FRAME_BYTES * frames, ULawSilence);
+// -------- μ-law helpers
+const ULawSilence = 0xFF;
+const FRAME_BYTES = 160; // 20ms @ 8kHz
 
 const padToFrame = (buf) => {
   const rem = buf.length % FRAME_BYTES;
@@ -96,7 +87,9 @@ const toFrames = (buf) => {
   return out;
 };
 
-// PCM16LE → μ-law (G.711) encoder
+const buildSilence = (frames=3) => Buffer.alloc(FRAME_BYTES * frames, ULawSilence);
+
+// PCM16LE → μ-law
 const pcm16ToUlaw = (pcmBuf) => {
   const BIAS = 0x84, CLIP = 32635;
   const out = Buffer.alloc(Math.floor(pcmBuf.length / 2));
@@ -114,7 +107,7 @@ const pcm16ToUlaw = (pcmBuf) => {
   return out;
 };
 
-// Crude decimator 24k → 8k (good enough for TTS Voice)
+// 24k → 8k simple decimator
 const downsamplePCM16LE = (pcmBuf, srcRate, dstRate) => {
   if (srcRate === dstRate) return pcmBuf;
   const ratio = srcRate / dstRate;
@@ -127,13 +120,26 @@ const downsamplePCM16LE = (pcmBuf, srcRate, dstRate) => {
   return out.subarray(0, o);
 };
 
-// ---------------- Deepgram (inbound μ-law@8k)
+// Generate 1s 440Hz tone μ-law@8k (diagnostic)
+const ulaw440Hz1s = (() => {
+  const hz = 440, sr = 8000, secs = 1;
+  const N = sr * secs;
+  const pcm = Buffer.alloc(N * 2);
+  for (let i = 0; i < N; i++) {
+    const sample = Math.round(0.6 * 32767 * Math.sin(2 * Math.PI * hz * (i / sr)));
+    pcm.writeInt16LE(sample, i * 2);
+  }
+  const ulaw = pcm16ToUlaw(pcm);
+  return ulaw;
+})();
+
+// -------- Deepgram
 const connectDeepgram = () => {
   const u = 'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2-general&punctuate=true&smart_format=true';
   return new WSClient(u, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
 };
 
-// ---------------- TTS (OpenAI-only while we debug)
+// -------- OpenAI TTS → μ-law@8k
 const synthesizeUlaw8000 = async (text) => {
   try {
     if (!OPENAI_API_KEY) throw new Error('No OPENAI_API_KEY');
@@ -142,9 +148,9 @@ const synthesizeUlaw8000 = async (text) => {
       { model: 'gpt-4o-mini-tts', voice: 'alloy', input: text, format: 'pcm' },
       { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, responseType: 'arraybuffer', timeout: 25000 }
     );
-    const pcm24k = Buffer.from(tts.data);                // PCM16LE @ 24k
-    const ulaw = pcm16ToUlaw(downsamplePCM16LE(pcm24k, 24000, 8000));
-    // Diagnostics: confirm it's raw μ-law (no RIFF)
+    const pcm24k = Buffer.from(tts.data); // expected: 24kHz, 16-bit LE, mono (no header)
+    const pcm8k  = downsamplePCM16LE(pcm24k, 24000, 8000);
+    const ulaw   = pcm16ToUlaw(pcm8k);
     log('info', 'TTS_DIAG', { first8hex: ulaw.subarray(0,8).toString('hex'), bytes: ulaw.length });
     return ulaw;
   } catch (err) {
@@ -153,7 +159,7 @@ const synthesizeUlaw8000 = async (text) => {
   }
 };
 
-// ---------------- Sender to Twilio (strict schema Twilio expects)
+// -------- Outbound sender (Twilio spec)
 const startAudioSender = (ws, streamSid) => {
   let q = []; let sending = false; let primed = false;
 
@@ -176,23 +182,15 @@ const startAudioSender = (ws, streamSid) => {
   };
 };
 
-// ---------------- LLM
+// -------- LLM (brief receptionist)
 const generateReply = async (userText) => {
   if (!OPENAI_API_KEY) return "I'm here. How can I help?";
   try {
-    const system = `You are a friendly, concise voice receptionist for ${BUSINESS_NAME}.
-- Be brief (1–2 sentences).
-- Confirm intent.
-- Offer to take a message or book an appointment.`;
-    const payload = {
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: userText || 'Hello' }
-      ],
-      temperature: 0.3,
-      max_tokens: 120
-    };
+    const system = `You are a concise voice receptionist for ${BUSINESS_NAME}. Keep answers 1–2 sentences. Offer to take a message or book an appointment.`;
+    const payload = { model: 'gpt-4o-mini', messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: userText || 'Hello' }
+    ], temperature: 0.3, max_tokens: 120 };
     const resp = await axios.post('https://api.openai.com/v1/chat/completions', payload, {
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
     });
@@ -203,14 +201,15 @@ const generateReply = async (userText) => {
   }
 };
 
-// ---------------- WS lifecycle
+// -------- WS lifecycle
 wss.on('connection', (ws, request) => {
-  const connId = uuidv4().slice(0, 8);
+  const connId = uuidv4().slice(0,8);
   log('info', 'WS_CONNECTED', { connId, ip: request.socket.remoteAddress });
 
   let streamSid = null;
   let dg = null;
   let sender = null;
+  let toneInjected = false;
 
   const ensureDG = () => {
     if (dg) return;
@@ -233,7 +232,7 @@ wss.on('connection', (ws, request) => {
           log('info', 'TTS_OK', { bytes: ulaw.length, text: reply });
           if (sender && streamSid && ulaw?.length) sender.enqueue(ulaw);
         }
-      } catch { /* ignore parse issues */ }
+      } catch { /* ignore parse errors */ }
     });
   };
 
@@ -241,16 +240,26 @@ wss.on('connection', (ws, request) => {
     let msg; try { msg = JSON.parse(frame.toString()); } catch { return; }
     const event = msg?.event;
 
-    if (event === 'start') {
+    if (event === 'connected') {
+      // no-op
+    } else if (event === 'start') {
       streamSid = msg?.start?.streamSid;
       log('info', 'WS_START', {
-        connId, streamSid, callSid: msg?.start?.callSid, tracks: msg?.start?.tracks
+        connId, streamSid, callSid: msg?.start?.callSid,
+        tracks: msg?.start?.tracks, mediaFormat: msg?.start?.mediaFormat
       });
       sender = startAudioSender(ws, streamSid);
+
+      // *** Diagnostic: send 1s 440Hz tone first ***
+      if (PLAY_TONE_FIRST === '1' && !toneInjected) {
+        toneInjected = true;
+        log('info', 'DIAG_TONE_ENQUEUE', { bytes: ulaw440Hz1s.length });
+        sender.enqueue(ulaw440Hz1s);
+      }
     } else if (event === 'media') {
       ensureDG();
       if (dg && dg.readyState === WebSocket.OPEN) {
-        const b = Buffer.from(msg.media.payload, 'base64');
+        const b = Buffer.from(msg.media.payload, 'base64'); // inbound μ-law@8k
         dg.send(b);
       }
     } else if (event === 'stop') {
@@ -264,7 +273,7 @@ wss.on('connection', (ws, request) => {
   ws.on('error', (err) => { log('error', 'WS_ERROR', { connId, err: err?.message }); try { dg?.close(); } catch {} });
 });
 
-// ---------------- Start
+// -------- Start
 server.listen(PORT, () => {
   log('info', 'Server listening', {
     PORT, PUBLIC_BASE_URL,
