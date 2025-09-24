@@ -6,6 +6,7 @@ import { WebSocketServer, WebSocket, WebSocket as WSClient } from 'ws';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 
+// Safe URL pathname helper (WHATWG)
 const pathOf = (req) => {
   try { return new URL(req.url, 'https://placeholder.local').pathname; }
   catch { return '/'; }
@@ -16,11 +17,12 @@ const {
   PUBLIC_BASE_URL,
   OPENAI_API_KEY,
   DEEPGRAM_API_KEY,
-  ELEVENLABS_API_KEY,
-  ELEVENLABS_VOICE_ID,
+  ELEVENLABS_API_KEY,      // not used while FORCE_TTS_OPENAI=1
+  ELEVENLABS_VOICE_ID,     // not used while FORCE_TTS_OPENAI=1
   BUSINESS_NAME = 'Your Business',
   LOG_LEVEL = 'debug',
-  FORCE_TTS_OPENAI = '1' // <-- default to OpenAI only for this test
+  // Keep OpenAI-only TTS while we verify audio path
+  FORCE_TTS_OPENAI = '1'
 } = process.env;
 
 const app = express();
@@ -37,10 +39,10 @@ const log = (level, msg, extra = {}) => {
 
 const xml = (obj) => new XMLBuilder({ ignoreAttributes: false }).build(obj);
 
-// ---------- Health
+// ---------------- Health
 app.get('/healthz', (_, res) => res.status(200).send('ok'));
 
-// ---------- Twilio Voice webhook -> <Connect><Stream>
+// ---------------- Twilio Voice webhook → <Connect><Stream>
 app.post('/twilio/voice', (req, res) => {
   log('info', 'HTTP_POST /twilio/voice', { from: req.body?.From, to: req.body?.To });
   if (!PUBLIC_BASE_URL) return res.status(500).send('Missing PUBLIC_BASE_URL');
@@ -49,11 +51,11 @@ app.post('/twilio/voice', (req, res) => {
   const wssRoot = root.replace(/^http/i, 'ws');
   const streamUrl = `${wssRoot}/stream`;
 
-  // Request BOTH directions explicitly.
+  // Valid per Twilio for <Connect><Stream>
   const twimlObj = {
     Response: {
       Connect: {
-        Stream: { '@_url': streamUrl, '@_track': 'both_tracks' }
+        Stream: { '@_url': streamUrl, '@_track': 'inbound_track' }
       }
     }
   };
@@ -63,7 +65,7 @@ app.post('/twilio/voice', (req, res) => {
   res.type('application/xml').status(200).send(twiml);
 });
 
-// ---------- HTTP + WS
+// ---------------- HTTP + single WS server
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
@@ -76,15 +78,17 @@ server.on('upgrade', (request, socket, head) => {
   }
 });
 
-// ---------- μ-law helpers
-const ULawSilence = 0xFF;
-const FRAME_BYTES = 160; // 20ms @ 8kHz
+// ---------------- μ-law helpers
+const ULawSilence = 0xFF;          // μ-law silence byte
+const FRAME_BYTES = 160;            // 20ms @ 8000 Hz μ-law mono
 
-const buildSilence = (frames=3) => Buffer.alloc(FRAME_BYTES * frames, ULawSilence);
+const buildSilence = (frames = 3) => Buffer.alloc(FRAME_BYTES * frames, ULawSilence);
+
 const padToFrame = (buf) => {
   const rem = buf.length % FRAME_BYTES;
   return rem === 0 ? buf : Buffer.concat([buf, Buffer.alloc(FRAME_BYTES - rem, ULawSilence)]);
 };
+
 const toFrames = (buf) => {
   const p = padToFrame(buf);
   const out = [];
@@ -92,7 +96,7 @@ const toFrames = (buf) => {
   return out;
 };
 
-// ---------- PCM16 -> μ-law + 24k->8k downsample (simple decimator)
+// PCM16LE → μ-law (G.711) encoder
 const pcm16ToUlaw = (pcmBuf) => {
   const BIAS = 0x84, CLIP = 32635;
   const out = Buffer.alloc(Math.floor(pcmBuf.length / 2));
@@ -109,6 +113,8 @@ const pcm16ToUlaw = (pcmBuf) => {
   }
   return out;
 };
+
+// Crude decimator 24k → 8k (good enough for TTS Voice)
 const downsamplePCM16LE = (pcmBuf, srcRate, dstRate) => {
   if (srcRate === dstRate) return pcmBuf;
   const ratio = srcRate / dstRate;
@@ -121,13 +127,13 @@ const downsamplePCM16LE = (pcmBuf, srcRate, dstRate) => {
   return out.subarray(0, o);
 };
 
-// ---------- Deepgram
+// ---------------- Deepgram (inbound μ-law@8k)
 const connectDeepgram = () => {
   const u = 'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2-general&punctuate=true&smart_format=true';
   return new WSClient(u, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
 };
 
-// ---------- TTS (FORCED OPENAI for this test)
+// ---------------- TTS (OpenAI-only while we debug)
 const synthesizeUlaw8000 = async (text) => {
   try {
     if (!OPENAI_API_KEY) throw new Error('No OPENAI_API_KEY');
@@ -136,9 +142,9 @@ const synthesizeUlaw8000 = async (text) => {
       { model: 'gpt-4o-mini-tts', voice: 'alloy', input: text, format: 'pcm' },
       { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, responseType: 'arraybuffer', timeout: 25000 }
     );
-    const pcm24k = Buffer.from(tts.data);
+    const pcm24k = Buffer.from(tts.data);                // PCM16LE @ 24k
     const ulaw = pcm16ToUlaw(downsamplePCM16LE(pcm24k, 24000, 8000));
-    // diagnostics
+    // Diagnostics: confirm it's raw μ-law (no RIFF)
     log('info', 'TTS_DIAG', { first8hex: ulaw.subarray(0,8).toString('hex'), bytes: ulaw.length });
     return ulaw;
   } catch (err) {
@@ -147,7 +153,7 @@ const synthesizeUlaw8000 = async (text) => {
   }
 };
 
-// ---------- Sender to Twilio (strict schema)
+// ---------------- Sender to Twilio (strict schema Twilio expects)
 const startAudioSender = (ws, streamSid) => {
   let q = []; let sending = false; let primed = false;
 
@@ -170,7 +176,7 @@ const startAudioSender = (ws, streamSid) => {
   };
 };
 
-// ---------- LLM
+// ---------------- LLM
 const generateReply = async (userText) => {
   if (!OPENAI_API_KEY) return "I'm here. How can I help?";
   try {
@@ -197,7 +203,7 @@ const generateReply = async (userText) => {
   }
 };
 
-// ---------- WS lifecycle
+// ---------------- WS lifecycle
 wss.on('connection', (ws, request) => {
   const connId = uuidv4().slice(0, 8);
   log('info', 'WS_CONNECTED', { connId, ip: request.socket.remoteAddress });
@@ -237,7 +243,9 @@ wss.on('connection', (ws, request) => {
 
     if (event === 'start') {
       streamSid = msg?.start?.streamSid;
-      log('info', 'WS_START', { connId, streamSid, callSid: msg?.start?.callSid, tracks: msg?.start?.tracks });
+      log('info', 'WS_START', {
+        connId, streamSid, callSid: msg?.start?.callSid, tracks: msg?.start?.tracks
+      });
       sender = startAudioSender(ws, streamSid);
     } else if (event === 'media') {
       ensureDG();
@@ -256,7 +264,7 @@ wss.on('connection', (ws, request) => {
   ws.on('error', (err) => { log('error', 'WS_ERROR', { connId, err: err?.message }); try { dg?.close(); } catch {} });
 });
 
-// ---------- Start
+// ---------------- Start
 server.listen(PORT, () => {
   log('info', 'Server listening', {
     PORT, PUBLIC_BASE_URL,
