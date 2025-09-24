@@ -5,7 +5,16 @@ import { XMLBuilder } from 'fast-xml-parser';
 import { WebSocketServer, WebSocket } from 'ws';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
-import url from 'node:url';
+
+// IMPORTANT: use WHATWG URL API (avoids the deprecation warning)
+const parsePathname = (req) => {
+  try {
+    const u = new URL(req.url, 'https://placeholder.local');
+    return u.pathname;
+  } catch {
+    return '/';
+  }
+}
 
 const {
   PORT = 10000,
@@ -54,7 +63,7 @@ app.post('/twilio/voice', (req, res) => {
       Connect: {
         Stream: {
           '@_url': streamUrl,
-          '@_track': 'inbound_track' // <-- FIXED (valid for <Connect><Stream>)
+          '@_track': 'inbound_track' // valid value for <Connect><Stream>
         }
       }
     }
@@ -70,7 +79,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
-  const { pathname } = url.parse(request.url);
+  const pathname = parsePathname(request);
   if (pathname === '/stream') {
     log('info', 'WS_UPGRADE /stream');
     wss.handleUpgrade(request, socket, head, (ws) => {
@@ -81,36 +90,81 @@ server.on('upgrade', (request, socket, head) => {
   }
 });
 
-// --- Audio send queue (160-byte μ-law frames @ ~20ms) ---
+// --- Helpers for outbound audio framing ---
+const ULawSilence = 0xFF; // μ-law silence byte
+const FRAME_BYTES = 160;   // 20ms @ 8000 Hz μ-law mono
+
+// Pad buffer to a multiple of 160 bytes (pad with μ-law silence)
+const padToFrame = (buf) => {
+  const rem = buf.length % FRAME_BYTES;
+  if (rem === 0) return buf;
+  const pad = Buffer.alloc(FRAME_BYTES - rem, ULawSilence);
+  return Buffer.concat([buf, pad]);
+};
+
+// Build a few priming frames of silence to avoid “static burst”
+const buildSilence = (frames = 3) => Buffer.alloc(FRAME_BYTES * frames, ULawSilence);
+
+// --- Outbound audio sender (to Twilio) ---
 const startAudioSender = (ws, streamSid) => {
   let queue = [];
   let sending = false;
+
+  // Twilio is strict about timing/length. We:
+  // - send 3 silent frames first,
+  // - then 20ms per 160-byte frame,
+  // - explicitly mark outbound track and contentType.
+  const primeIfNeeded = () => {
+    if (queue._primed) return;
+    queue.unshift(...chunkToFrames(buildSilence(3)));
+    queue._primed = true;
+  };
+
+  const chunkToFrames = (buf) => {
+    const frames = [];
+    const padded = padToFrame(buf);
+    for (let i = 0; i < padded.length; i += FRAME_BYTES) {
+      frames.push(padded.subarray(i, i + FRAME_BYTES));
+    }
+    return frames;
+  };
 
   const sendChunk = () => {
     if (!queue.length || ws.readyState !== WebSocket.OPEN) {
       sending = false;
       return;
     }
-    const chunk = queue.shift();
-    const payload = chunk.toString('base64');
-    const msg = { event: 'media', streamSid, media: { payload } };
+    const frame = queue.shift();
+    const payload = frame.toString('base64');
+
+    const msg = {
+      event: 'media',
+      streamSid,
+      // Some implementations require declaring outbound explicitly:
+      track: 'outbound',
+      media: {
+        // Twilio expects μ-law 8k; contentType is helpful/harmless on WS.
+        contentType: 'audio/x-mulaw;rate=8000',
+        payload
+      }
+    };
+
     ws.send(JSON.stringify(msg));
     setTimeout(sendChunk, 20);
   };
 
   return {
     enqueue: (buf) => {
-      for (let i = 0; i < buf.length; i += 160) {
-        const slice = buf.subarray(i, Math.min(i + 160, buf.length));
-        if (slice.length === 160) queue.push(slice);
-      }
+      primeIfNeeded();
+      const frames = chunkToFrames(buf);
+      queue.push(...frames);
       if (!sending) { sending = true; sendChunk(); }
     },
-    clear: () => { queue = []; }
+    clear: () => { queue = []; queue._primed = false; }
   };
 };
 
-// --- LLM reply ---
+// --- LLM reply (unchanged) ---
 const generateReply = async (userText) => {
   if (!OPENAI_API_KEY) return "I'm here. How can I help?";
   try {
@@ -132,13 +186,14 @@ const generateReply = async (userText) => {
     });
     return resp.data?.choices?.[0]?.message?.content?.trim() || "Okay. How can I help?";
   } catch (err) {
-    log('warn', 'LLM_FALLBACK', { err: err?.response?.data || err?.message });
+    console.warn('LLM_FALLBACK', err?.response?.data || err?.message);
     return "Okay. How can I help?";
   }
 };
 
 // --- TTS (ElevenLabs ulaw_8000, fallback to OpenAI -> μ-law) ---
 const synthesizeUlaw8000 = async (text) => {
+  // Try ElevenLabs (already μ-law 8k)
   if (ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID) {
     try {
       const el = await axios.post(
@@ -148,9 +203,10 @@ const synthesizeUlaw8000 = async (text) => {
       );
       if (el.status === 200 && el.data?.byteLength) return Buffer.from(el.data);
     } catch (err) {
-      log('warn', 'ELEVENLABS_TTS_FAIL', { err: err?.response?.data || err?.message });
+      console.warn('ELEVENLABS_TTS_FAIL', err?.response?.data || err?.message);
     }
   }
+  // Fallback: OpenAI TTS -> PCM -> downsample -> μ-law
   try {
     if (!OPENAI_API_KEY) throw new Error('No OPENAI_API_KEY');
     const tts = await axios.post(
@@ -158,16 +214,16 @@ const synthesizeUlaw8000 = async (text) => {
       { model: 'gpt-4o-mini-tts', voice: 'alloy', input: text, format: 'pcm' },
       { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, responseType: 'arraybuffer', timeout: 25000 }
     );
-    const pcm = Buffer.from(tts.data);               // 24k PCM16LE
+    const pcm = Buffer.from(tts.data); // 24k PCM16LE
     const down = downsamplePCM16LE(pcm, 24000, 8000);
     return pcm16ToUlaw(down);
   } catch (err) {
-    log('error', 'OPENAI_TTS_FAIL', { err: err?.response?.data || err?.message });
+    console.error('OPENAI_TTS_FAIL', err?.response?.data || err?.message);
     return Buffer.alloc(0);
   }
 };
 
-// --- DSP helpers ---
+// --- DSP helpers (unchanged) ---
 const pcm16ToUlaw = (pcmBuf) => {
   const BIAS = 0x84, CLIP = 32635;
   const out = Buffer.alloc(Math.floor(pcmBuf.length / 2));
@@ -198,11 +254,12 @@ const downsamplePCM16LE = (pcmBuf, srcRate, dstRate) => {
   return out.subarray(0, o);
 };
 
-// --- Deepgram connection (mulaw@8k) ---
+// --- Deepgram connection (unchanged) ---
+import { WebSocket as WSClient } from 'ws';
 const connectDeepgram = () => {
   const u = 'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2-general&punctuate=true&smart_format=true';
   const headers = { Authorization: `Token ${DEEPGRAM_API_KEY}` };
-  return new WebSocket(u, { headers });
+  return new WSClient(u, { headers });
 };
 
 // --- WS lifecycle (single instance) ---
