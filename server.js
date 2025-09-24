@@ -54,7 +54,7 @@ app.post('/twilio/voice', (req, res) => {
       Connect: {
         Stream: {
           '@_url': streamUrl,
-          '@_track': 'inbound_audio'
+          '@_track': 'inbound_track' // <-- FIXED (valid for <Connect><Stream>)
         }
       }
     }
@@ -67,8 +67,6 @@ app.post('/twilio/voice', (req, res) => {
 
 // --- HTTP server + single WS server ---
 const server = http.createServer(app);
-
-// Single, global WS server instance (DO NOT DUPLICATE)
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
