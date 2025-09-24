@@ -37,7 +37,7 @@ app.get('/healthz', (_, res) => res.status(200).send('ok'));
 
 // Twilio Voice Webhook -> returns TwiML with <Connect><Stream>
 app.post('/twilio/voice', (req, res) => {
-  log('info', 'HTTP_POST /twilio/voice: received', { from: req.body?.From, to: req.body?.To });
+  log('info', 'HTTP_POST /twilio/voice', { from: req.body?.From, to: req.body?.To });
 
   if (!PUBLIC_BASE_URL) {
     log('error', 'PUBLIC_BASE_URL missing');
@@ -45,9 +45,9 @@ app.post('/twilio/voice', (req, res) => {
   }
 
   // Force wss:// for Twilio Media Streams (CRITICAL)
-  const root = PUBLIC_BASE_URL.replace(/\/+$/,'');           // no trailing slash
-  const wssRoot = root.replace(/^http/i, 'ws');              // https:// -> wss://
-  const streamUrl = `${wssRoot}/stream`;                     // wss://…/stream
+  const root = PUBLIC_BASE_URL.replace(/\/+$/, ''); // no trailing slash
+  const wssRoot = root.replace(/^http/i, 'ws');     // https:// -> wss://
+  const streamUrl = `${wssRoot}/stream`;
 
   const twimlObj = {
     Response: {
@@ -65,11 +65,10 @@ app.post('/twilio/voice', (req, res) => {
   res.set('Content-Type', 'application/xml').status(200).send(twiml);
 });
 
-// --- HTTP Server & WebSocket Upgrade ---
-import { createServer } from 'http';
-const server = createServer(app);
+// --- HTTP server + single WS server ---
+const server = http.createServer(app);
 
-// WS server bound via manual upgrade (path = /stream)
+// Single, global WS server instance (DO NOT DUPLICATE)
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
@@ -208,11 +207,7 @@ const connectDeepgram = () => {
   return new WebSocket(u, { headers });
 };
 
-// --- WS lifecycle ---
-const wss = new WebSocketServer({ noServer: true });
-
-server.on('request', app);
-
+// --- WS lifecycle (single instance) ---
 wss.on('connection', (ws, request) => {
   const connId = uuidv4().slice(0, 8);
   log('info', 'WS_CONNECTED', { connId, ip: request.socket.remoteAddress });
