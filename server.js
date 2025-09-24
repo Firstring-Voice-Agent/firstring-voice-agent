@@ -1,294 +1,284 @@
 import 'dotenv/config';
+import http from 'http';
 import express from 'express';
-import crypto from 'crypto';
-import { v4 as uuidv4 } from 'uuid';
+import { XMLBuilder } from 'fast-xml-parser';
 import { WebSocketServer, WebSocket } from 'ws';
 import axios from 'axios';
-import { XMLBuilder } from 'fast-xml-parser';
-import http from 'http';
+import { v4 as uuidv4 } from 'uuid';
+import url from 'node:url';
 
 const {
-  PORT = 8080,
+  PORT = 10000,
   PUBLIC_BASE_URL,
   OPENAI_API_KEY,
   DEEPGRAM_API_KEY,
   ELEVENLABS_API_KEY,
   ELEVENLABS_VOICE_ID,
-  N8N_BASE,
-  BUSINESS_ID = 'plumber_joes',
-  BUSINESS_NAME = "Plumber Joe's",
-  CAL_SUMMARY_PREFIX = 'Job',
-  TWILIO_AUTH_TOKEN
+  BUSINESS_NAME = 'Your Business',
+  LOG_LEVEL = 'debug'
 } = process.env;
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// no-auth health + root (kept noisy on purpose for debug)
-app.get('/', (_, res) => { console.log('HTTP_GET /'); res.send('ok'); });
-app.get('/healthz', (_, res) => { console.log('HTTP_GET /healthz'); res.send('ok'); });
+const log = (level, msg, extra = {}) => {
+  const levels = ['error','warn','info','debug'];
+  if (levels.indexOf(level) <= levels.indexOf(LOG_LEVEL)) {
+    const ts = new Date().toISOString();
+    console.log(`${ts} ${level.toUpperCase()} ${msg}`, Object.keys(extra).length ? extra : '');
+  }
+};
 
-/* ---------- Twilio webhook signature (safe to leave on) ---------- */
-function verifyTwilio(req) {
-  if (!TWILIO_AUTH_TOKEN) return true; // skip if not set
-  const url = `${PUBLIC_BASE_URL.replace(/\/$/, '')}/twilio/voice`;
-  const body = req.body || {};
-  const params = Object.keys(body).sort().map(k => k + body[k]).join('');
-  const expected = crypto.createHmac('sha1', TWILIO_AUTH_TOKEN)
-    .update(url + params, 'utf8').digest('base64');
-  const sig = req.headers['x-twilio-signature'];
-  const ok = sig === expected;
-  if (!ok) console.error('TWILIO_SIGNATURE_FAIL');
-  return ok;
-}
+const xml = (obj) => new XMLBuilder({ ignoreAttributes: false }).build(obj);
 
-/* ---------- Twilio hits this first ---------- */
+// Health
+app.get('/healthz', (_, res) => res.status(200).send('ok'));
+
+// Twilio Voice Webhook -> returns TwiML with <Connect><Stream>
 app.post('/twilio/voice', (req, res) => {
-  console.log('HTTP_POST /twilio/voice: received, From=', req.body?.From,
-              'PUBLIC_BASE_URL=', PUBLIC_BASE_URL);
+  log('info', 'HTTP_POST /twilio/voice: received', { from: req.body?.From, to: req.body?.To });
 
-  if (!verifyTwilio(req)) return res.status(403).send('Bad signature');
+  if (!PUBLIC_BASE_URL) {
+    log('error', 'PUBLIC_BASE_URL missing');
+    return res.status(500).send('Server config error');
+  }
 
-  // IMPORTANT: Twilio connects to wss://HOST/stream afterwards
-  const streamUrl = `${PUBLIC_BASE_URL
-    .replace(/^http/, 'ws')
-    .replace(/\/$/, '')
-  }/stream`;
+  // Force wss:// for Twilio Media Streams (CRITICAL)
+  const root = PUBLIC_BASE_URL.replace(/\/+$/,'');           // no trailing slash
+  const wssRoot = root.replace(/^http/i, 'ws');              // https:// -> wss://
+  const streamUrl = `${wssRoot}/stream`;                     // wss://…/stream
 
-  console.log('Responding with <Stream> url=', streamUrl);
-
-  const xmlObj = {
+  const twimlObj = {
     Response: {
       Connect: {
         Stream: {
           '@_url': streamUrl,
-          '@_bidirectional': 'true',
-          Parameter: [{ '@_name': 'caller', '@_value': req.body.From || '' }]
+          '@_track': 'inbound_audio'
         }
       }
     }
   };
-  const builder = new XMLBuilder({ ignoreAttributes: false });
-  res.type('text/xml').send(builder.build(xmlObj));
+
+  const twiml = xml(twimlObj);
+  log('info', 'Responding with <Stream>', { url: streamUrl });
+  res.set('Content-Type', 'application/xml').status(200).send(twiml);
 });
 
-/* ===================== audio helpers ===================== */
-function encodeLinearToMuLaw(sample) {
-  const sign = sample < 0 ? 0x80 : 0;
-  if (sample < 0) sample = -sample;
-  let exponent = 7;
-  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
-  const mantissa = (sample >> (exponent + 3)) & 0x0F;
-  return ~(sign | (exponent << 4) | mantissa) & 0xFF;
-}
+// --- HTTP Server & WebSocket Upgrade ---
+import { createServer } from 'http';
+const server = createServer(app);
 
-async function ttsOpenAI(text) {
-  if (!OPENAI_API_KEY) return new Uint8Array(0);
-  try {
-    console.log('TTS_OPENAI start, len=', text?.length);
-    const r = await axios.post('https://api.openai.com/v1/audio/speech', {
-      model: 'gpt-4o-mini-tts',
-      voice: 'alloy',
-      input: text
-    }, { responseType: 'arraybuffer', headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }});
-    const pcm16 = new Int16Array(new Uint8Array(r.data).buffer);
-    const step = 3; // ~24k -> 8k naive downsample
-    const out = new Uint8Array(Math.floor(pcm16.length / step));
-    for (let i = 0, j = 0; i < pcm16.length; i += step, j++) {
-      const s = Math.max(-32768, Math.min(32767, pcm16[i]));
-      out[j] = encodeLinearToMuLaw(s);
-    }
-    console.log('TTS_OPENAI ok bytes=', out.length);
-    return out;
-  } catch (e) {
-    console.error('TTS_OPENAI_ERR', e?.response?.status, e?.response?.data || e.message);
-    return new Uint8Array(0);
-  }
-}
+// WS server bound via manual upgrade (path = /stream)
+const wss = new WebSocketServer({ noServer: true });
 
-async function ttsSynthesize(text) {
-  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
-    console.warn('TTS_11LABS missing key/voice, using OpenAI fallback');
-    return await ttsOpenAI(text);
-  }
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=4&output_format=ulaw_8000`;
-  try {
-    console.log('TTS_11LABS start, len=', text?.length);
-    const r = await axios.post(
-      url,
-      {
-        text,
-        model_id: 'eleven_multilingual_v2',
-        voice_settings: { stability: 0.65, similarity_boost: 0.78, style: 0.28, use_speaker_boost: true }
-      },
-      { responseType: 'arraybuffer', headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'content-type': 'application/json' } }
-    );
-    const ct = (r.headers?.['content-type'] || '').toLowerCase();
-    if (ct.includes('application/json')) {
-      console.error('TTS_11LABS_JSON', Buffer.from(r.data).toString('utf8'));
-      return await ttsOpenAI(text);
-    }
-    const out = new Uint8Array(r.data);
-    console.log('TTS_11LABS ok bytes=', out.length);
-    return out;
-  } catch (e) {
-    let body = '';
-    try { body = Buffer.from(e?.response?.data || []).toString('utf8'); } catch {}
-    console.error('TTS_11LABS_ERR', e?.response?.status, body || e.message);
-    return await ttsOpenAI(text);
-  }
-}
-
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-async function wsSendMedia(ws, mulawBytes, streamSid) {
-  if (!streamSid) { console.error('TWILIO_NO_STREAMSID'); return; }
-  const chunkSize = 160;          // 20ms @ 8kHz
-  for (let i = 0; i < mulawBytes.length; i += chunkSize) {
-    const chunk = mulawBytes.slice(i, i + chunkSize);
-    const msg = { event: 'media', streamSid, media: { payload: Buffer.from(chunk).toString('base64') } };
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
-    await sleep(20);
-  }
-}
-
-async function llmReply(prompt, system = 'Stay concise. Ask only what you need to book a job.') {
-  try {
-    console.log('LLM_REPLY send');
-    const r = await axios.post('https://api.openai.com/v1/chat/completions', {
-      model: 'gpt-4o-mini',
-      temperature: 0.3,
-      messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }]
-    }, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }});
-    const out = r.data.choices?.[0]?.message?.content?.trim() || 'Got it.';
-    console.log('LLM_REPLY ok');
-    return out;
-  } catch (e) {
-    console.error('LLM_REPLY_ERR', e?.response?.status, e?.response?.data || e.message);
-    return 'Okay.';
-  }
-}
-
-function parseJsonLoose(text) {
-  if (!text) return null;
-  const s = text.indexOf('{'), e = text.lastIndexOf('}');
-  if (s === -1 || e === -1 || e < s) return null;
-  try { return JSON.parse(text.slice(s, e + 1)); } catch { return null; }
-}
-
-async function llmExtract(text) {
-  const prompt = `Extract strict JSON with fields:
-caller_name, suburb, job_type, urgency(one of: now,today,this_week,no_rush), preferred_time, call_summary.
-Only return JSON. Message:\n${text}`;
-  try {
-    console.log('LLM_EXTRACT send');
-    const r = await axios.post('https://api.openai.com/v1/chat/completions', {
-      model: 'gpt-4o-mini',
-      temperature: 0,
-      messages: [{ role: 'system', content: 'You output only strict JSON.' }, { role: 'user', content: prompt }]
-    }, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }});
-    const raw = r.data.choices?.[0]?.message?.content?.trim() || '{}';
-    const parsed = parseJsonLoose(raw);
-    console.log('LLM_EXTRACT ok');
-    return parsed || { caller_name: '', suburb: '', job_type: '', urgency: 'this_week', preferred_time: '', call_summary: text.slice(0,800) };
-  } catch (e) {
-    console.error('LLM_EXTRACT_ERR', e?.response?.status, e?.response?.data || e.message);
-    return { caller_name: '', suburb: '', job_type: '', urgency: 'this_week', preferred_time: '', call_summary: text.slice(0,800) };
-  }
-}
-
-/* ===================== WebSocket server ===================== */
-/*  FIX: accept 'audio-stream' when protocols is a Set or array */
-const wss = new WebSocketServer({
-  noServer: true,
-  handleProtocols: (protocols) => {
-    const offered = Array.isArray(protocols)
-      ? protocols
-      : (protocols && typeof protocols.forEach === 'function'
-          ? Array.from(protocols)
-          : []);
-    const ok = offered.map(String).map(s => s.toLowerCase()).includes('audio-stream');
-    console.log('WS_HANDLE_PROTOCOLS offered=', offered, 'ok=', ok);
-    return ok ? 'audio-stream' : false;   // if false, handshake fails (Twilio will fallback)
-  }
-});
-
-wss.on('connection', async (ws, req) => {
-  console.log('WS_CONNECTED', req.url);
-  const sessionId = uuidv4();
-  const state = { id: sessionId, caller: '', streamSid: '', fullTranscript: [] };
-  let mediaCount = 0;
-
-  const dgUrl = 'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&punctuate=true&model=enhanced';
-  console.log('DG_CONNECT', dgUrl);
-  const dg = new WebSocket(dgUrl, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }});
-
-  dg.on('open', () => console.log('DG_OPEN'));
-  dg.on('error', (e) => console.error('DG_ERR', e.message));
-  dg.on('message', async (buf) => {
-    try {
-      const msg = JSON.parse(buf.toString());
-      const alt = msg.channel?.alternatives?.[0];
-      if (!alt) return;
-      const transcript = alt.transcript || '';
-      if (msg.is_final && transcript) {
-        state.fullTranscript.push(transcript);
-        const reply = await llmReply(`Caller said: "${transcript}". Reply in one sentence as a helpful trades receptionist. Confirm details when you have enough info.`);
-        const bytes = await ttsSynthesize(reply);
-        console.log('TTS_REPLY_LEN', bytes.length);
-        await wsSendMedia(ws, bytes, state.streamSid);
-      }
-    } catch {}
-  });
-
-  ws.on('message', async raw => {
-    try {
-      const msg = JSON.parse(raw.toString());
-      if (msg.event === 'start') {
-        state.caller = msg.start?.customParameters?.caller || '';
-        state.streamSid = msg.start?.streamSid || '';
-        console.log('TWILIO_START streamSid=', state.streamSid, 'caller=', state.caller);
-        const greet = await ttsSynthesize(`Hi, this is FirstRing A I for ${BUSINESS_NAME}. How can I help you today?`);
-        console.log('TTS_GREETING_LEN', greet.length);
-        await wsSendMedia(ws, greet, state.streamSid);
-      }
-      if (msg.event === 'media') {
-        mediaCount++;
-        if (dg.readyState === WebSocket.OPEN) dg.send(Buffer.from(msg.media?.payload || '', 'base64'));
-        if (mediaCount % 50 === 0) console.log('TWILIO_MEDIA_IN', mediaCount);
-      }
-      if (msg.event === 'stop') {
-        console.log('TWILIO_STOP');
-        try { dg.close(); } catch {}
-        const text = state.fullTranscript.join(' ');
-        const fields = await llmExtract(text || 'Caller hung up quickly.');
-        console.log('POST_LEAD', fields);
-      }
-    } catch (e) {
-      console.error('WS_MSG_ERR', e.message);
-    }
-  });
-
-  ws.on('close', () => console.log('WS_CLOSED'));
-  ws.on('error', (e) => console.error('WS_ERR', e.message));
-});
-
-const server = http.createServer(app);
-server.on('upgrade', (req, socket, head) => {
-  const proto = req.headers['sec-websocket-protocol'];
-  console.log('WS_UPGRADE', req.url, 'header.sec-websocket-protocol=', proto);
-  if (req.url === '/stream') {
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+server.on('upgrade', (request, socket, head) => {
+  const { pathname } = url.parse(request.url);
+  if (pathname === '/stream') {
+    log('info', 'WS_UPGRADE /stream');
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
   } else {
     socket.destroy();
   }
 });
 
+// --- Audio send queue (160-byte μ-law frames @ ~20ms) ---
+const startAudioSender = (ws, streamSid) => {
+  let queue = [];
+  let sending = false;
+
+  const sendChunk = () => {
+    if (!queue.length || ws.readyState !== WebSocket.OPEN) {
+      sending = false;
+      return;
+    }
+    const chunk = queue.shift();
+    const payload = chunk.toString('base64');
+    const msg = { event: 'media', streamSid, media: { payload } };
+    ws.send(JSON.stringify(msg));
+    setTimeout(sendChunk, 20);
+  };
+
+  return {
+    enqueue: (buf) => {
+      for (let i = 0; i < buf.length; i += 160) {
+        const slice = buf.subarray(i, Math.min(i + 160, buf.length));
+        if (slice.length === 160) queue.push(slice);
+      }
+      if (!sending) { sending = true; sendChunk(); }
+    },
+    clear: () => { queue = []; }
+  };
+};
+
+// --- LLM reply ---
+const generateReply = async (userText) => {
+  if (!OPENAI_API_KEY) return "I'm here. How can I help?";
+  try {
+    const system = `You are a friendly, concise voice receptionist for ${BUSINESS_NAME}.
+- Be brief (1–2 sentences).
+- Confirm intent.
+- Offer to take a message or book an appointment.`;
+    const payload = {
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: userText || 'Hello' }
+      ],
+      temperature: 0.3,
+      max_tokens: 120
+    };
+    const resp = await axios.post('https://api.openai.com/v1/chat/completions', payload, {
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
+    });
+    return resp.data?.choices?.[0]?.message?.content?.trim() || "Okay. How can I help?";
+  } catch (err) {
+    log('warn', 'LLM_FALLBACK', { err: err?.response?.data || err?.message });
+    return "Okay. How can I help?";
+  }
+};
+
+// --- TTS (ElevenLabs ulaw_8000, fallback to OpenAI -> μ-law) ---
+const synthesizeUlaw8000 = async (text) => {
+  if (ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID) {
+    try {
+      const el = await axios.post(
+        `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`,
+        { text, model_id: 'eleven_turbo_v2_5', output_format: 'ulaw_8000' },
+        { headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' }, responseType: 'arraybuffer', timeout: 20000 }
+      );
+      if (el.status === 200 && el.data?.byteLength) return Buffer.from(el.data);
+    } catch (err) {
+      log('warn', 'ELEVENLABS_TTS_FAIL', { err: err?.response?.data || err?.message });
+    }
+  }
+  try {
+    if (!OPENAI_API_KEY) throw new Error('No OPENAI_API_KEY');
+    const tts = await axios.post(
+      'https://api.openai.com/v1/audio/speech',
+      { model: 'gpt-4o-mini-tts', voice: 'alloy', input: text, format: 'pcm' },
+      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, responseType: 'arraybuffer', timeout: 25000 }
+    );
+    const pcm = Buffer.from(tts.data);               // 24k PCM16LE
+    const down = downsamplePCM16LE(pcm, 24000, 8000);
+    return pcm16ToUlaw(down);
+  } catch (err) {
+    log('error', 'OPENAI_TTS_FAIL', { err: err?.response?.data || err?.message });
+    return Buffer.alloc(0);
+  }
+};
+
+// --- DSP helpers ---
+const pcm16ToUlaw = (pcmBuf) => {
+  const BIAS = 0x84, CLIP = 32635;
+  const out = Buffer.alloc(Math.floor(pcmBuf.length / 2));
+  for (let i = 0, j = 0; i < pcmBuf.length; i += 2, j++) {
+    let s = pcmBuf.readInt16LE(i);
+    if (s > CLIP) s = CLIP; else if (s < -CLIP) s = -CLIP;
+    const sign = s < 0 ? 0x80 : 0x00;
+    if (s < 0) s = -s;
+    s += BIAS;
+    let exp = 7;
+    for (let mask = 0x4000; (s & mask) === 0 && exp > 0; mask >>= 1) exp--;
+    const mant = (s >> ((exp === 0) ? 4 : (exp + 3))) & 0x0F;
+    out[j] = ~(sign | (exp << 4) | mant) & 0xFF;
+  }
+  return out;
+};
+
+const downsamplePCM16LE = (pcmBuf, srcRate, dstRate) => {
+  if (srcRate === dstRate) return pcmBuf;
+  const ratio = srcRate / dstRate;
+  const out = Buffer.alloc(Math.floor(pcmBuf.length / 2 / ratio) * 2);
+  let o = 0;
+  for (let i = 0; i + 2 <= pcmBuf.length; i += 2 * ratio) {
+    const sample = pcmBuf.readInt16LE(Math.floor(i));
+    out.writeInt16LE(sample, o);
+    o += 2;
+  }
+  return out.subarray(0, o);
+};
+
+// --- Deepgram connection (mulaw@8k) ---
+const connectDeepgram = () => {
+  const u = 'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2-general&punctuate=true&smart_format=true';
+  const headers = { Authorization: `Token ${DEEPGRAM_API_KEY}` };
+  return new WebSocket(u, { headers });
+};
+
+// --- WS lifecycle ---
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('request', app);
+
+wss.on('connection', (ws, request) => {
+  const connId = uuidv4().slice(0, 8);
+  log('info', 'WS_CONNECTED', { connId, ip: request.socket.remoteAddress });
+
+  let streamSid = null;
+  let dg = null;
+  let sender = null;
+
+  const ensureDG = () => {
+    if (dg) return;
+    if (!DEEPGRAM_API_KEY) { log('warn', 'DG_SKIP (no key)'); return; }
+    dg = connectDeepgram();
+    log('info', 'DG_CONNECT', { connId });
+    dg.on('open', () => log('info', 'DG_OPEN', { connId }));
+    dg.on('close', () => log('info', 'DG_CLOSE', { connId }));
+    dg.on('error', (err) => log('error', 'DG_ERROR', { err: err?.message }));
+    dg.on('message', async (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        const alt = msg?.channel?.alternatives?.[0];
+        const isFinal = msg?.is_final || msg?.speech_final;
+        const transcript = (alt?.transcript || '').trim();
+        if (isFinal && transcript) {
+          log('info', 'DG_FINAL', { transcript });
+          const reply = await generateReply(transcript);
+          const ulaw = await synthesizeUlaw8000(reply);
+          log('info', 'TTS_OK', { bytes: ulaw.length, text: reply });
+          if (sender && streamSid && ulaw?.length) sender.enqueue(ulaw);
+        }
+      } catch { /* ignore parse issues */ }
+    });
+  };
+
+  ws.on('message', (frame) => {
+    let msg; try { msg = JSON.parse(frame.toString()); } catch { return; }
+    const event = msg?.event;
+
+    if (event === 'start') {
+      streamSid = msg?.start?.streamSid;
+      log('info', 'WS_START', { connId, streamSid, callSid: msg?.start?.callSid });
+      sender = startAudioSender(ws, streamSid);
+    } else if (event === 'media') {
+      ensureDG();
+      if (dg && dg.readyState === WebSocket.OPEN) {
+        const b = Buffer.from(msg.media.payload, 'base64');
+        dg.send(b);
+      }
+    } else if (event === 'stop') {
+      log('info', 'WS_STOP', { connId, streamSid });
+      try { dg?.close(); } catch {}
+      try { ws?.close(); } catch {}
+    }
+  });
+
+  ws.on('close', () => { log('info', 'WS_CLOSE', { connId, streamSid }); try { dg?.close(); } catch {} });
+  ws.on('error', (err) => { log('error', 'WS_ERROR', { connId, err: err?.message }); try { dg?.close(); } catch {} });
+});
+
+// Start server
 server.listen(PORT, () => {
-  console.log('FirstRing (Deepgram+11Labs/OpenAI fallback) on', PORT);
-  console.log('ENV_CHECK', {
-    PUBLIC_BASE_URL, HAVE_DG: !!DEEPGRAM_API_KEY,
-    HAVE_OAI: !!OPENAI_API_KEY, HAVE_XI: !!ELEVENLABS_API_KEY,
+  log('info', 'Server listening', {
+    PORT,
+    PUBLIC_BASE_URL,
+    HAVE_DG: !!DEEPGRAM_API_KEY,
+    HAVE_OAI: !!OPENAI_API_KEY,
+    HAVE_XI: !!ELEVENLABS_API_KEY,
     VOICE: ELEVENLABS_VOICE_ID
   });
 });
